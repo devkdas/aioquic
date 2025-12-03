@@ -50,6 +50,11 @@ class QuicConfiguration:
     Whether this is the client side of the QUIC connection.
     """
 
+    send_hrr: bool = False
+    """
+    Whether to send a HelloRetryRequest to the client.
+    """
+
     max_data: int = 1048576
     """
     Connection-wide flow control limit.

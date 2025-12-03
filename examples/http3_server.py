@@ -630,6 +630,11 @@ if __name__ == "__main__":
         help="send a retry for new connections",
     )
     parser.add_argument(
+        "--send-hrr",
+        action="store_true",
+        help="send a HelloRetryRequest for new connections",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="increase logging verbosity"
     )
     parser.add_argument(
@@ -696,6 +701,7 @@ if __name__ == "__main__":
         max_datagram_size=args.max_datagram_size,
         quic_logger=quic_logger,
         secrets_log_file=secrets_log_file,
+        send_hrr=args.send_hrr,
         supported_versions=[
             QuicProtocolVersion.VERSION_2,
             QuicProtocolVersion.VERSION_1,

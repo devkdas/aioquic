@@ -56,6 +56,10 @@ TLS_VERSION_1_3_DRAFT_26 = 0x7F1A
 
 CLIENT_CONTEXT_STRING = b"TLS 1.3, client CertificateVerify"
 SERVER_CONTEXT_STRING = b"TLS 1.3, server CertificateVerify"
+HELLO_RETRY_REQUEST_RANDOM = (
+    b"\xcf\x21\xad\x74\xe5\x9a\x61\x11\xbe\x1d\x8c\x02\x1e\x65\xb8\x91"
+    b"\xc2\xa2\x11\x16\x7a\xbb\x8c\x5e\x07\x9e\x09\xe2\xc8\xa8\x33\x9c"
+)
 
 T = TypeVar("T")
 
@@ -735,8 +739,11 @@ def pull_server_hello(buf: Buffer) -> ServerHello:
         if buf.pull_uint16() != TLS_VERSION_1_2:
             raise AlertDecodeError("ServerHello version is not 1.2")
 
+        random = buf.pull_bytes(32)
+        is_hrr = random == HELLO_RETRY_REQUEST_RANDOM
+
         hello = ServerHello(
-            random=buf.pull_bytes(32),
+            random=random,
             legacy_session_id=pull_opaque(buf, 1),
             cipher_suite=buf.pull_uint16(),
             compression_method=buf.pull_uint8(),
@@ -749,7 +756,15 @@ def pull_server_hello(buf: Buffer) -> ServerHello:
             if extension_type == ExtensionType.SUPPORTED_VERSIONS:
                 hello.supported_version = buf.pull_uint16()
             elif extension_type == ExtensionType.KEY_SHARE:
-                hello.key_share = pull_key_share(buf)
+                if is_hrr:
+                    # for a HelloRetryRequest the key_share is the selected group
+                    if extension_length != 2:
+                        raise AlertDecodeError(
+                            "HelloRetryRequest key_share must be 2 bytes"
+                        )
+                    hello.key_share = (buf.pull_uint16(), b"")
+                else:
+                    hello.key_share = pull_key_share(buf)
             elif extension_type == ExtensionType.PRE_SHARED_KEY:
                 hello.pre_shared_key = buf.pull_uint16()
             else:
@@ -780,7 +795,11 @@ def push_server_hello(buf: Buffer, hello: ServerHello) -> None:
 
             if hello.key_share is not None:
                 with push_extension(buf, ExtensionType.KEY_SHARE):
-                    push_key_share(buf, hello.key_share)
+                    if hello.random == HELLO_RETRY_REQUEST_RANDOM:
+                        # for a HelloRetryRequest the key_share is the selected group
+                        buf.push_uint16(hello.key_share[0])
+                    else:
+                        push_key_share(buf, hello.key_share)
 
             if hello.pre_shared_key is not None:
                 with push_extension(buf, ExtensionType.PRE_SHARED_KEY):
@@ -1256,10 +1275,12 @@ class Context:
         logger: Optional[Union[logging.Logger, logging.LoggerAdapter]] = None,
         max_early_data: Optional[int] = None,
         server_name: Optional[str] = None,
+        send_hrr: bool = False,
         verify_mode: Optional[int] = None,
     ):
         # configuration
         self._alpn_protocols = alpn_protocols
+        self._send_hrr = send_hrr
         self._cadata = cadata
         self._cafile = cafile
         self._capath = capath
@@ -1324,6 +1345,8 @@ class Context:
         self.key_schedule: Optional[KeySchedule] = None
         self.received_extensions: Optional[List[Extension]] = None
         self._certificate_request: Optional[CertificateRequest] = None
+        self._client_hello_1_bytes: Optional[bytes] = None
+        self._hello_retry_request_bytes: Optional[bytes] = None
         self._key_schedule_psk: Optional[KeySchedule] = None
         self._key_schedule_proxy: Optional[KeyScheduleProxy] = None
         self._new_session_ticket: Optional[NewSessionTicket] = None
@@ -1619,6 +1642,8 @@ class Context:
         with push_message(self._key_schedule_proxy, output_buf):
             push_client_hello(output_buf, hello)
 
+        self._client_hello_1_bytes = output_buf.data_slice(0, output_buf.tell())
+
         self._set_state(State.CLIENT_EXPECT_SERVER_HELLO)
 
     def _client_handle_hello(self, input_buf: Buffer, output_buf: Buffer) -> None:
@@ -1629,6 +1654,36 @@ class Context:
             [peer_hello.cipher_suite],
             AlertHandshakeFailure("Unsupported cipher suite"),
         )
+
+
+        # check for HRR
+        if peer_hello.random == HELLO_RETRY_REQUEST_RANDOM:
+            if self.key_schedule is not None:
+                raise AlertUnexpectedMessage("Second HelloRetryRequest")
+
+            # create a new key schedule and hash
+            ch1_hash_obj = hashes.Hash(cipher_suite_hash(cipher_suite))
+            ch1_hash_obj.update(self._client_hello_1_bytes)
+            ch1_hash = ch1_hash_obj.finalize()
+
+            message_hash = (
+                b"\xfe"
+                + len(ch1_hash).to_bytes(3, byteorder="big")
+                + ch1_hash
+            )
+
+            self.key_schedule = KeySchedule(cipher_suite)
+            self.key_schedule.extract(None)
+            self.key_schedule.update_hash(message_hash)
+            self.key_schedule.update_hash(input_buf.data)  # HelloRetryRequest
+
+            self._key_schedule_proxy = None  # discard proxy
+
+            self._client_handle_hello_retry_request(
+                input_buf, output_buf, peer_hello=peer_hello
+            )
+            return
+
         if peer_hello.compression_method not in self._legacy_compression_methods:
             raise AlertIllegalParameter(
                 "ServerHello has a compression method we did not advertise"
@@ -1648,7 +1703,7 @@ class Context:
                 raise AlertIllegalParameter
             self.key_schedule = self._key_schedule_psk
             self._session_resumed = True
-        else:
+        elif self.key_schedule is None:
             self.key_schedule = self._key_schedule_proxy.select(cipher_suite)
         self._key_schedule_psk = None
         self._key_schedule_proxy = None
@@ -1683,6 +1738,38 @@ class Context:
         )
 
         self._set_state(State.CLIENT_EXPECT_ENCRYPTED_EXTENSIONS)
+
+    def _client_handle_hello_retry_request(
+        self, input_buf: Buffer, output_buf: Buffer, peer_hello: ServerHello
+    ) -> None:
+        # create a new ClientHello
+        group = peer_hello.key_share[0]
+        if group == Group.X25519:
+            self._x25519_private_key = x25519.X25519PrivateKey.generate()
+            key_share = [encode_public_key(self._x25519_private_key.public_key())]
+        elif group in GROUP_TO_CURVE:
+            ec_private_key = ec.generate_private_key(GROUP_TO_CURVE[group]())
+            self._ec_private_keys.append(ec_private_key)
+            key_share = [encode_public_key(ec_private_key.public_key())]
+        else:
+            raise AlertIllegalParameter("Unsupported key share group")
+
+        hello = ClientHello(
+            random=self.client_random,
+            legacy_session_id=self.legacy_session_id,
+            cipher_suites=[int(x) for x in self._cipher_suites],
+            legacy_compression_methods=self._legacy_compression_methods,
+            alpn_protocols=self._alpn_protocols,
+            key_share=key_share,
+            signature_algorithms=self._signature_algorithms,
+            supported_groups=self._supported_groups,
+            supported_versions=self._supported_versions,
+            other_extensions=self.handshake_extensions,
+        )
+        with push_message(self.key_schedule, output_buf):
+            push_client_hello(output_buf, hello)
+
+        self._set_state(State.CLIENT_EXPECT_SERVER_HELLO)
 
     def _client_handle_encrypted_extensions(self, input_buf: Buffer) -> None:
         encrypted_extensions = pull_encrypted_extensions(input_buf)
@@ -1904,9 +1991,28 @@ class Context:
                 AlertHandshakeFailure("No common ALPN protocols"),
             )
 
-        self.client_random = peer_hello.random
+        if self.client_random is None:
+            self.client_random = peer_hello.random
+            self.legacy_session_id = peer_hello.legacy_session_id
+
+        # if we are asked to send a HelloRetryRequest, do so
+        if self._send_hrr and self._client_hello_1_bytes is None:
+            self._client_hello_1_bytes = input_buf.data_slice(0, input_buf.tell())
+
+            # send hello retry request
+            hello = ServerHello(
+                random=HELLO_RETRY_REQUEST_RANDOM,
+                legacy_session_id=self.legacy_session_id,
+                cipher_suite=cipher_suite,
+                compression_method=compression_method,
+                key_share=(self._supported_groups[0], b""),
+                supported_version=supported_version,
+            )
+            push_server_hello(initial_buf, hello)
+            self._hello_retry_request_bytes = initial_buf.data
+            return
+
         self.server_random = os.urandom(32)
-        self.legacy_session_id = peer_hello.legacy_session_id
         self.received_extensions = peer_hello.other_extensions
 
         # notify application
@@ -1969,9 +2075,27 @@ class Context:
 
         # if PSK is not used, initialize key schedule
         if pre_shared_key is None:
-            self.key_schedule = KeySchedule(cipher_suite)
-            self.key_schedule.extract(None)
-            self.key_schedule.update_hash(input_buf.data)
+            if self._client_hello_1_bytes is None:
+                self.key_schedule = KeySchedule(cipher_suite)
+                self.key_schedule.extract(None)
+                self.key_schedule.update_hash(input_buf.data)
+            else:
+                # create a new key schedule and hash
+                ch1_hash = hashes.Hash(cipher_suite_hash(cipher_suite))
+                ch1_hash.update(self._client_hello_1_bytes)
+                message_hash = ch1_hash.finalize()
+
+                self.key_schedule = KeySchedule(cipher_suite)
+                self.key_schedule.extract(None)
+                self.key_schedule.update_hash(
+                    b"\xfe"
+                    + len(message_hash).to_bytes(3, byteorder="big")
+                    + message_hash
+                )
+                self.key_schedule.update_hash(self._hello_retry_request_bytes)
+                self.key_schedule.update_hash(input_buf.data)
+                self._client_hello_1_bytes = None
+                self._hello_retry_request_bytes = None
 
         # perform key exchange
         public_key: Union[
