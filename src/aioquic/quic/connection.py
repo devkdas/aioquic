@@ -519,6 +519,12 @@ class QuicConnection:
         self._network_paths = [QuicNetworkPath(addr, is_validated=True)]
         if self._configuration.original_version is not None:
             self._version = self._configuration.original_version
+        elif (
+            self._configuration.offered_versions
+            and self._configuration.offered_versions[0]
+            in self._configuration.supported_versions
+        ):
+            self._version = self._configuration.offered_versions[0]
         else:
             self._version = self._configuration.supported_versions[0]
         self._connect(now=now)
@@ -1184,30 +1190,31 @@ class QuicConnection:
         # For servers, determine the Negotiated Version.
         if not self._is_client and not self._version_negotiated_compatible:
             if self._remote_version_information is not None:
-                # Pick the first version we support in the client's available versions,
-                # which is compatible with the current version.
-                for version in self._remote_version_information.available_versions:
-                    if version == self._version:
-                        # Stay with the current version.
-                        break
-                    elif (
-                        version in self._configuration.supported_versions
+                # Pick the first version we support which is also in the client's
+                # available versions and is compatible with the current version.
+                best_version = self._version
+                for version in self._configuration.supported_versions:
+                    if (
+                        version in self._remote_version_information.available_versions
                         and is_version_compatible(self._version, version)
                     ):
-                        # Change version.
-                        self._version = version
-                        self._cryptos[tls.Epoch.INITIAL] = self._cryptos_initial[
-                            version
-                        ]
-
-                        # Update our transport parameters to reflect the chosen version.
-                        self.tls.handshake_extensions = [
-                            (
-                                tls.ExtensionType.QUIC_TRANSPORT_PARAMETERS,
-                                self._serialize_transport_parameters(),
-                            )
-                        ]
+                        best_version = version
                         break
+
+                if best_version != self._version:
+                    # Change version.
+                    self._version = best_version
+                    self._cryptos[tls.Epoch.INITIAL] = self._cryptos_initial[
+                        self._version
+                    ]
+
+                    # Update our transport parameters to reflect the chosen version.
+                    self.tls.handshake_extensions = [
+                        (
+                            tls.ExtensionType.QUIC_TRANSPORT_PARAMETERS,
+                            self._serialize_transport_parameters(),
+                        )
+                    ]
             self._version_negotiated_compatible = True
             self._logger.info(
                 "Negotiated protocol version %s", pretty_protocol_version(self._version)
@@ -2885,7 +2892,9 @@ class QuicConnection:
             stateless_reset_token=self._host_cids[0].stateless_reset_token,
             version_information=QuicVersionInformation(
                 chosen_version=self._version,
-                available_versions=self._configuration.supported_versions,
+                available_versions=self._configuration.offered_versions
+                if self._configuration.offered_versions is not None
+                else self._configuration.supported_versions,
             ),
         )
         if not self._is_client:

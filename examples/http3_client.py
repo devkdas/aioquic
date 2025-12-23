@@ -897,6 +897,16 @@ if __name__ == "__main__":
         default=1,
         help="the number of streams to create (default: 1)",
     )
+    parser.add_argument(
+        "--offered-versions",
+        type=str,
+        help="the QUIC versions to advertise, e.g. `1,2`",
+    )
+    parser.add_argument(
+        "--supported-versions",
+        type=str,
+        help="the QUIC versions to support, e.g. `1,2`",
+    )
 
     args = parser.parse_args()
 
@@ -939,6 +949,17 @@ if __name__ == "__main__":
     elif args.strictly_v2:
         configuration.original_version = QuicProtocolVersion.VERSION_2
         configuration.supported_versions = [QuicProtocolVersion.VERSION_2]
+
+    # version negotiation
+    if args.offered_versions is not None:
+        configuration.offered_versions = [
+            QuicProtocolVersion(int(v)) for v in args.offered_versions.split(",")
+        ]
+    if args.supported_versions is not None:
+        configuration.supported_versions = [
+            QuicProtocolVersion(int(v)) for v in args.supported_versions.split(",")
+        ]
+
     if args.quic_log:
         configuration.quic_logger = QuicFileLogger(args.quic_log)
     if args.secrets_log:

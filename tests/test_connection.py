@@ -488,7 +488,7 @@ class QuicConnectionTest(TestCase):
             server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
-            self.assertAlmostEqual(server.get_timer(), 0.425)
+            self.assertAlmostEqual(server.get_timer(), 0.475)
             self.assertSentPackets(server, [0, 0, 1])
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
@@ -551,7 +551,7 @@ class QuicConnectionTest(TestCase):
             server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
-            self.assertAlmostEqual(server.get_timer(), 0.625)
+            self.assertAlmostEqual(server.get_timer(), 0.675)
             self.assertSentPackets(server, [0, 0, 1])
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
@@ -627,7 +627,7 @@ class QuicConnectionTest(TestCase):
             server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
-            self.assertAlmostEqual(server.get_timer(), 0.525)
+            self.assertAlmostEqual(server.get_timer(), 0.575)
             self.assertSentPackets(server, [0, 0, 1])
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
@@ -701,7 +701,7 @@ class QuicConnectionTest(TestCase):
             server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
-            self.assertAlmostEqual(server.get_timer(), 0.625)
+            self.assertAlmostEqual(server.get_timer(), 0.675)
             self.assertSentPackets(server, [0, 0, 1])
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
@@ -837,7 +837,7 @@ class QuicConnectionTest(TestCase):
             server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
-            self.assertAlmostEqual(server.get_timer(), 0.425)
+            self.assertAlmostEqual(server.get_timer(), 0.475)
             self.assertSentPackets(server, [0, 0, 1])
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
@@ -846,7 +846,7 @@ class QuicConnectionTest(TestCase):
             server.handle_timer(now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [29])
-            self.assertAlmostEqual(server.get_timer(), 0.975)
+            self.assertAlmostEqual(server.get_timer(), 1.125)
             self.assertSentPackets(server, [0, 0, 2])
             self.assertEvents(server, [])
 
@@ -867,7 +867,7 @@ class QuicConnectionTest(TestCase):
             items = server.datagrams_to_send(now=now)
             self.assertFalse(server._handshake_done_pending)
             self.assertEqual(datagram_sizes(items), [224])
-            self.assertAlmostEqual(server.get_timer(), 0.7625)
+            self.assertAlmostEqual(server.get_timer(), 0.85)
             self.assertSentPackets(server, [0, 0, 1])
             # FIXME: the server re-emits the ConnectionIdIssued events
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS[1:])
@@ -884,7 +884,7 @@ class QuicConnectionTest(TestCase):
             server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [])
-            self.assertAlmostEqual(server.get_timer(), 60.625)  # idle timeout
+            self.assertAlmostEqual(server.get_timer(), 60.675)  # idle timeout
             self.assertSentPackets(server, [0, 0, 0])
             self.assertEvents(server, [])
 
@@ -1024,6 +1024,65 @@ class QuicConnectionTest(TestCase):
             self.assertEqual(client._version, QuicProtocolVersion.VERSION_1)
             self.assertEqual(server._version, QuicProtocolVersion.VERSION_1)
 
+    def test_connect_with_compatible_version_negotiation_downgrade(self):
+        """
+        The client originally connects using version 2 but the server prefers
+        version 1.
+        The server sets the Negotiated Version to version 1.
+        """
+        with client_and_server(
+            client_options={
+                "offered_versions": [
+                    QuicProtocolVersion.VERSION_2,
+                    QuicProtocolVersion.VERSION_1,
+                ],
+                "supported_versions": [
+                    QuicProtocolVersion.VERSION_2,
+                    QuicProtocolVersion.VERSION_1,
+                ],
+            },
+            server_options={
+                "supported_versions": [
+                    QuicProtocolVersion.VERSION_1,
+                    QuicProtocolVersion.VERSION_2,
+                ],
+            },
+        ) as (client, server):
+            # check handshake completed
+            self.check_handshake(client=client, server=server)
+            self.assertEqual(client._version, QuicProtocolVersion.VERSION_1)
+            self.assertEqual(server._version, QuicProtocolVersion.VERSION_1)
+
+    def test_connect_with_compatible_version_negotiation_upgrade(self):
+        """
+        The client originally connects using version 1 but the server prefers
+        version 2.
+
+        The server sets the Negotiated Version to version 2.
+        """
+        with client_and_server(
+            client_options={
+                "offered_versions": [
+                    QuicProtocolVersion.VERSION_1,
+                    QuicProtocolVersion.VERSION_2,
+                ],
+                "supported_versions": [
+                    QuicProtocolVersion.VERSION_1,
+                    QuicProtocolVersion.VERSION_2,
+                ],
+            },
+            server_options={
+                "supported_versions": [
+                    QuicProtocolVersion.VERSION_2,
+                    QuicProtocolVersion.VERSION_1,
+                ],
+            },
+        ) as (client, server):
+            # check handshake completed
+            self.check_handshake(client=client, server=server)
+            self.assertEqual(client._version, QuicProtocolVersion.VERSION_2)
+            self.assertEqual(server._version, QuicProtocolVersion.VERSION_2)
+
     def test_connect_with_quantum_readiness(self):
         with client_and_server(client_options={"quantum_readiness_test": True}) as (
             client,
@@ -1055,12 +1114,20 @@ class QuicConnectionTest(TestCase):
         with client_and_server(
             client_kwargs={"session_ticket_handler": save_session_ticket},
             server_kwargs={"session_ticket_handler": ticket_store.add},
+            client_options={"supported_versions": [QuicProtocolVersion.VERSION_1]},
+            server_options={"supported_versions": [QuicProtocolVersion.VERSION_1]},
         ) as (client, server):
             pass
 
         with client_and_server(
-            client_options={"session_ticket": client_ticket},
+            client_options={
+                "session_ticket": client_ticket,
+                "supported_versions": [QuicProtocolVersion.VERSION_1],
+            },
             server_kwargs={"session_ticket_fetcher": ticket_store.pop},
+            server_options={
+                "supported_versions": [QuicProtocolVersion.VERSION_1],
+            },
             handshake=False,
         ) as (client, server):
             client.connect(SERVER_ADDR, now=time.time())
