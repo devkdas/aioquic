@@ -122,6 +122,298 @@ You can also upload files using `curl` with the `PUT` method (which `curl -T` us
 (The `-k` flag for `curl` allows it to work with self-signed certificates like the
 example `ssl_cert.pem`.)
 
+HTTP/3 Streaming
+~~~~~~~~~~~~~~~~
+
+The client and server support long-lived HTTP/3 streaming for continuous data
+transfer testing over QUIC. This is useful for evaluating QUIC/HTTP3 behavior
+under sustained load, measuring throughput, testing connection stability over
+extended periods, and verifying protocol robustness with fuzz data.
+
+There are two streaming modes:
+
+1. **Unidirectional (``--stream``)**: The server generates and pushes random
+   data chunks to the client. The client receives and optionally displays the
+   data without saving to disk. This is useful for testing downstream throughput
+   and server-side streaming behavior.
+
+2. **Bidirectional (``--stream-bidi``)**: The client sends data chunks to the
+   server via a POST request to the ``/stream-echo`` endpoint, and the server
+   echoes each chunk back. This is useful for testing round-trip latency,
+   upload/download symmetry, and full-duplex streaming behavior.
+
+Getting Started with Streaming
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+First, start the HTTP/3 server:
+
+.. code-block:: console
+
+   python examples/http3_server.py --certificate tests/ssl_cert.pem --private-key tests/ssl_key.pem
+
+**Basic unidirectional streaming** — server pushes 1024-byte chunks every second:
+
+.. code-block:: console
+
+  python examples/http3_client.py --insecure --stream https://localhost:4433/stream
+
+**Basic bidirectional streaming** — client sends, server echoes back:
+
+.. code-block:: console
+
+  python examples/http3_client.py --insecure --stream-bidi https://localhost:4433/stream-echo
+
+Both modes run indefinitely by default (until Ctrl+C). Use ``--stream-duration``
+to limit the session length.
+
+Streaming Options Reference
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+**Mode Selection:**
+
+``--stream``
+    Enable unidirectional streaming mode. The server pushes random data chunks
+    to the client continuously. The client connects to the ``/stream`` endpoint
+    on the server.
+
+``--stream-bidi``
+    Enable bidirectional streaming mode. The client sends random data chunks
+    to the server's ``/stream-echo`` endpoint, and the server echoes each chunk
+    back to the client. Cannot be combined with ``--stream``.
+
+**Data Control:**
+
+``--stream-chunk-size <bytes>``
+    Set the size of each data chunk in bytes. Default: ``1024``.
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-chunk-size 8192 https://localhost:4433/stream
+
+``--stream-chunk-vary <min,max>``
+    Use variable (randomized) chunk sizes instead of a fixed size. The actual
+    chunk size for each transmission is randomly chosen between ``min`` and
+    ``max`` bytes. This overrides ``--stream-chunk-size`` and is useful for
+    simulating realistic traffic patterns where packet sizes vary.
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-chunk-vary 256,8192 https://localhost:4433/stream
+
+``--stream-interval <seconds>``
+    Set the time interval between sending/receiving data chunks, in seconds.
+    Default: ``1.0``. Use smaller values for higher throughput testing.
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-interval 0.1 https://localhost:4433/stream
+
+``--stream-duration <seconds>``
+    Limit the streaming session to the specified number of seconds. Default:
+    ``0`` (infinite — runs until Ctrl+C). For example, to stream for exactly
+    5 minutes:
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-duration 300 https://localhost:4433/stream
+
+``--stream-binary``
+    Use raw binary mode instead of hex-encoded text output. In binary mode,
+    the client displays chunk statistics (size, count) instead of decoded text.
+    This provides higher throughput since there is no encoding/decoding overhead.
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-binary https://localhost:4433/stream
+
+**Throughput and Parallelism:**
+
+``--stream-max-rate <bytes/sec>``
+    Throttle bandwidth to the specified maximum rate in bytes per second.
+    Default: ``0`` (unlimited). The client enforces this by inserting delays
+    between chunks. Useful for simulating constrained network conditions.
+
+    Example — limit to 100 KB/s:
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-max-rate 102400 https://localhost:4433/stream
+
+``--num-streams <N>``
+    Open N parallel streams simultaneously over the same QUIC connection.
+    Default: ``1``. Each stream operates independently, sending/receiving its
+    own data. Streams are labeled ``[S1]``, ``[S2]``, etc. in the output.
+    This is useful for testing multiplexing behavior and concurrent stream
+    handling.
+
+    Example — 10 parallel bidirectional streams:
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream-bidi --num-streams 10 https://localhost:4433/stream-echo
+
+**Output Control:**
+
+``--stream-quiet``
+    Suppress printing of received data to the console. The client will still
+    log summary statistics (total bytes, throughput) via the logger. This is
+    recommended for high-throughput testing where console output becomes a
+    bottleneck.
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-quiet https://localhost:4433/stream
+
+**Reliability:**
+
+``--stream-reconnect <retries>``
+    Automatically reconnect if the streaming connection drops. The client will
+    retry up to the specified number of times, with a 1-second delay between
+    attempts. Default: ``0`` (disabled — connection errors are raised
+    immediately). This is essential for long-running sessions that may
+    experience intermittent network issues.
+
+    Example — auto-reconnect up to 10 times:
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --stream --stream-reconnect 10 https://localhost:4433/stream
+
+**Fuzz Testing:**
+
+``--stream-fuzz``
+    Send malicious/fuzz test data instead of random bytes. Only works with
+    ``--stream-bidi`` mode. The fuzz data includes:
+
+    - Invalid UTF-8 byte sequences
+    - Control characters and null bytes
+    - Overlong encodings
+    - Boundary values and edge-case payloads
+    - Mixed valid/invalid data
+
+    This is useful for testing server robustness and ensuring the echo endpoint
+    handles malformed data gracefully without crashing.
+
+    Example — fuzz test for 60 seconds:
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure \
+        --stream-bidi --stream-fuzz \
+        --stream-duration 60 \
+        https://localhost:4433/stream-echo
+
+Connection Stability for Long-Running Sessions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When running streaming sessions for extended periods (hours or days), connection
+drops can occur due to:
+
+- **QUIC idle timeout**: If no data is exchanged within the idle timeout window,
+  the QUIC connection is closed. The default is 300 seconds (5 minutes).
+- **NAT/firewall mapping expiry**: Network Address Translation (NAT) devices and
+  stateful firewalls maintain mapping tables for UDP flows. These mappings
+  typically expire after 30–120 seconds of inactivity, causing the connection
+  to silently break.
+- **Memory leaks**: Stream handler resources that are not cleaned up after
+  completion can accumulate over time. The client now automatically cleans up
+  stream handlers in ``finally`` blocks to prevent this.
+
+The following options address these issues:
+
+``--idle-timeout <seconds>``
+    Set the QUIC idle timeout in seconds. Default: ``300`` (5 minutes).
+    **Both the client and server must be configured with matching or compatible
+    values.** For long sessions, set this to a high value such as ``86400``
+    (24 hours). Note that if data is continuously flowing, the idle timer is
+    reset on every packet, so the timeout only matters during periods of
+    inactivity.
+
+    Server:
+
+    .. code-block:: console
+
+       python examples/http3_server.py \
+         --certificate tests/ssl_cert.pem --private-key tests/ssl_key.pem \
+         --idle-timeout 86400
+
+    Client:
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --idle-timeout 86400 --stream https://localhost:4433/stream
+
+``--keepalive <seconds>``
+    Send QUIC PING frames at the specified interval to keep the connection
+    alive. Default: ``0`` (disabled). When enabled, the client sends a PING
+    frame every N seconds in the background, which:
+
+    - Prevents the QUIC idle timeout from firing during brief pauses in data.
+    - Refreshes NAT/firewall UDP mapping tables so the connection is not
+      silently dropped.
+    - Has minimal bandwidth overhead (each PING is a few bytes).
+
+    Recommended value: ``30`` seconds (well within typical NAT timeout windows).
+
+    .. code-block:: console
+
+      python examples/http3_client.py --insecure --keepalive 30 --stream https://localhost:4433/stream
+
+**Recommended configuration for 24-hour streaming sessions:**
+
+.. code-block:: console
+
+   # Server
+   python examples/http3_server.py \
+     --certificate tests/ssl_cert.pem --private-key tests/ssl_key.pem \
+     --idle-timeout 86400
+
+   # Client
+   python examples/http3_client.py --insecure \
+     --idle-timeout 86400 \
+     --keepalive 30 \
+     --stream-reconnect 5 \
+     --stream-bidi \
+     --stream-duration 0 \
+     --stream-chunk-vary 512,8192 \
+     --stream-quiet \
+     --num-streams 4 \
+     https://localhost:4433/stream-echo
+
+This configuration:
+
+- Sets a 24-hour idle timeout on both ends.
+- Sends keepalive PINGs every 30 seconds to maintain NAT mappings.
+- Auto-reconnects up to 5 times on any connection failure.
+- Uses 4 parallel bidirectional streams with variable chunk sizes.
+- Suppresses data output for maximum throughput.
+
+IPv6 Support
+^^^^^^^^^^^^
+
+All streaming features work identically over IPv4 and IPv6. The client
+automatically detects and handles IPv6 addresses, including IPv4-mapped IPv6
+addresses (e.g., ``::ffff:192.168.1.1``).
+
+**Streaming over IPv6 loopback:**
+
+.. code-block:: console
+
+  python examples/http3_client.py --insecure --local-ip "::1" --stream https://[::1]:4433/stream
+
+**Bidirectional streaming over IPv6:**
+
+.. code-block:: console
+
+  python examples/http3_client.py --insecure \
+    --local-ip "::1" \
+    --stream-bidi \
+    https://[::1]:4433/stream-echo
+
+The default ``--local-ip`` is ``::`` which binds to all available IPv4 and IPv6
+interfaces. When connecting to an IPv6 server address, enclose the address in
+square brackets in the URL (e.g., ``https://[::1]:4433/``).
+
 Chromium and Chrome usage
 .........................
 
