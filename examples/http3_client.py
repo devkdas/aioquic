@@ -40,7 +40,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection, QuicTokenHandler
 from aioquic.quic.events import QuicEvent
 from aioquic.quic.logger import QuicFileLogger
-from aioquic.quic.packet import QuicProtocolVersion
+from aioquic.quic.packet import QuicProtocolVersion, pretty_protocol_version
 from aioquic.tls import CipherSuite, SessionTicket, SessionTicketHandler
 
 try:
@@ -768,6 +768,7 @@ async def main(
     stream_bidi: bool = False,
     stream_fuzz: bool = False,
     keepalive: float = 0,
+    expect_hrr: bool = False,
 ) -> None:
     # parse URL
     parsed = urlparse(urls[0])
@@ -812,6 +813,45 @@ async def main(
         wait_connected=not zero_rtt,
     ) as client:
         client = cast(HttpClient, client)
+
+        # Log HRR result after handshake
+        if expect_hrr:
+            if hasattr(client._quic, '_retry_source_connection_id') and client._quic._retry_source_connection_id is not None:
+                print("[client] HRR (HelloRetryRequest) completed: server sent retry packet for address validation")
+                logger.info("HRR completed: server sent retry packet for address validation")
+            else:
+                print("[client] HRR expected but no retry packet was received from server")
+                logger.info("HRR expected but no retry packet was received from server")
+
+        # Log version negotiation result after handshake
+        negotiated_version = client._quic._version
+        if negotiated_version is not None:
+            print("[client] Handshake complete. Negotiated QUIC version: %s" % pretty_protocol_version(negotiated_version))
+            logger.info(
+                "Handshake complete. Negotiated QUIC version: %s",
+                pretty_protocol_version(negotiated_version),
+            )
+            if configuration.original_version is not None and negotiated_version != configuration.original_version:
+                if client._quic._version_negotiated_incompatible:
+                    print("[client] Version changed from %s -> %s (via VN packet, incompatible negotiation)" % (
+                        pretty_protocol_version(configuration.original_version),
+                        pretty_protocol_version(negotiated_version),
+                    ))
+                    logger.info(
+                        "Version changed from %s -> %s (via VN packet, incompatible negotiation)",
+                        pretty_protocol_version(configuration.original_version),
+                        pretty_protocol_version(negotiated_version),
+                    )
+                else:
+                    print("[client] Version changed from %s -> %s (compatible negotiation, no VN packet)" % (
+                        pretty_protocol_version(configuration.original_version),
+                        pretty_protocol_version(negotiated_version),
+                    ))
+                    logger.info(
+                        "Version changed from %s -> %s (compatible negotiation)",
+                        pretty_protocol_version(configuration.original_version),
+                        pretty_protocol_version(negotiated_version),
+                    )
 
         if parsed.scheme == "wss":
             ws = await client.websocket(urls[0], subprotocols=["chat", "superchat"])
@@ -1305,11 +1345,35 @@ if __name__ == "__main__":
         action="store_true",
         help="start with QUIC v1 and try to negotiate QUIC v2",
     )
-
+    parser.add_argument(
+        "--upgrade-v2",
+        action="store_true",
+        help="upgrade: start with QUIC v1, negotiate to QUIC v2 (alias for --negotiate-v2)",
+    )
+    parser.add_argument(
+        "--downgrade-v1",
+        action="store_true",
+        help="downgrade: start with QUIC v2, negotiate to QUIC v1 (compatible, no VN packet)",
+    )
+    parser.add_argument(
+        "--vn-upgrade-v2",
+        action="store_true",
+        help="upgrade via VN packet: start with QUIC v1 only, server rejects and sends VN, client restarts with v2 (requires server --only-v2)",
+    )
+    parser.add_argument(
+        "--vn-downgrade-v1",
+        action="store_true",
+        help="downgrade via VN packet: start with QUIC v2 only, server rejects and sends VN, client restarts with v1 (requires server --only-v1)",
+    )
     parser.add_argument(
         "--strictly-v2",
         action="store_true",
         help="connect using only QUIC v2, fail if not supported",
+    )
+    parser.add_argument(
+        "--expect-hrr",
+        action="store_true",
+        help="expect HelloRetryRequest (HRR) from server: log HRR-related events (works with both QUIC v1 and v2)",
     )
 
     parser.add_argument(
@@ -1446,8 +1510,24 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.negotiate_v2 and args.strictly_v2:
-        parser.error("argument --strictly-v2: not allowed with argument --negotiate-v2")
+    # Merge --upgrade-v2 into --negotiate-v2 (they are aliases)
+    if args.upgrade_v2:
+        args.negotiate_v2 = True
+
+    # Mutual exclusivity check for version flags
+    version_flags = []
+    if args.negotiate_v2:
+        version_flags.append("--negotiate-v2/--upgrade-v2")
+    if args.downgrade_v1:
+        version_flags.append("--downgrade-v1")
+    if args.vn_upgrade_v2:
+        version_flags.append("--vn-upgrade-v2")
+    if args.vn_downgrade_v1:
+        version_flags.append("--vn-downgrade-v1")
+    if args.strictly_v2:
+        version_flags.append("--strictly-v2")
+    if len(version_flags) > 1:
+        parser.error("the following arguments are mutually exclusive: " + ", ".join(version_flags))
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -1483,9 +1563,66 @@ if __name__ == "__main__":
             QuicProtocolVersion.VERSION_2,
             QuicProtocolVersion.VERSION_1,
         ]
+        print("[client] Upgrading (compatible): starting with %s, will negotiate to %s (no VN packet)" % (
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+        ))
+        logger.info(
+            "Upgrade mode: starting with %s, will negotiate to %s",
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+        )
+    elif args.downgrade_v1:
+        configuration.original_version = QuicProtocolVersion.VERSION_2
+        configuration.supported_versions = [
+            QuicProtocolVersion.VERSION_1,
+            QuicProtocolVersion.VERSION_2,
+        ]
+        print("[client] Downgrading (compatible): starting with %s, will negotiate to %s (no VN packet)" % (
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+        ))
+        logger.info(
+            "Downgrade mode: starting with %s, will negotiate to %s",
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+        )
+    elif args.vn_upgrade_v2:
+        configuration.original_version = QuicProtocolVersion.VERSION_1
+        configuration.supported_versions = [
+            QuicProtocolVersion.VERSION_2,
+            QuicProtocolVersion.VERSION_1,
+        ]
+        print("[client] Upgrading (with VN packet): sending Initial with %s, expecting VN packet from server, will restart with %s" % (
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+        ))
+        logger.info(
+            "VN upgrade mode: sending Initial with %s, expecting VN packet, will restart with %s (server must use --only-v2)",
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+        )
+    elif args.vn_downgrade_v1:
+        configuration.original_version = QuicProtocolVersion.VERSION_2
+        configuration.supported_versions = [
+            QuicProtocolVersion.VERSION_1,
+            QuicProtocolVersion.VERSION_2,
+        ]
+        print("[client] Downgrading (with VN packet): sending Initial with %s, expecting VN packet from server, will restart with %s" % (
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+        ))
+        logger.info(
+            "VN downgrade mode: sending Initial with %s, expecting VN packet, will restart with %s (server must use --only-v1)",
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+        )
     elif args.strictly_v2:
         configuration.original_version = QuicProtocolVersion.VERSION_2
         configuration.supported_versions = [QuicProtocolVersion.VERSION_2]
+    if args.expect_hrr:
+        print("[client] Expecting HRR (HelloRetryRequest) from server: server should send retry packet for address validation")
+        logger.info("Expecting HRR from server (works with both QUIC v1 and v2)")
     if args.quic_log:
         configuration.quic_logger = QuicFileLogger(args.quic_log)
     if args.secrets_log:
@@ -1534,5 +1671,6 @@ if __name__ == "__main__":
             stream_bidi=args.stream_bidi,
             stream_fuzz=args.stream_fuzz,
             keepalive=args.keepalive,
+            expect_hrr=args.expect_hrr,
         )
     )
