@@ -557,13 +557,25 @@ async def main(
     # (HelloRetryRequest-like behavior). Enable retry if HRR is requested.
     use_retry = retry or send_hrr
     if send_hrr:
-        print("[server] HRR (HelloRetryRequest) enabled: server will send retry packets for client address validation")
+        print(
+            "[server] HRR (HelloRetryRequest) enabled:"
+            " server will send retry packets for"
+            " client address validation"
+        )
+        ver_str = ", ".join(
+            pretty_protocol_version(v)
+            for v in configuration.supported_versions
+        )
         logging.getLogger("server").info(
-            "HRR enabled: sending retry packets for address validation (QUIC %s)",
-            ", ".join(pretty_protocol_version(v) for v in configuration.supported_versions),
+            "HRR enabled: sending retry packets"
+            " for address validation (QUIC %s)",
+            ver_str,
         )
     elif retry:
-        print("[server] Retry enabled: server will send retry packets for new connections")
+        print(
+            "[server] Retry enabled: server will send"
+            " retry packets for new connections"
+        )
         logging.getLogger("server").info("Retry enabled for new connections")
     await serve(
         host,
@@ -645,7 +657,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--send-hrr",
         action="store_true",
-        help="enable HelloRetryRequest (HRR): send retry packets for client address validation (works with both QUIC v1 and v2)",
+        help=(
+            "enable HelloRetryRequest (HRR): send retry"
+            " packets for client address validation"
+            " (works with both QUIC v1 and v2)"
+        ),
     )
     parser.add_argument(
         "--prefer-v1",
@@ -655,7 +671,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prefer-v2",
         action="store_true",
-        help="prefer QUIC v2 (for upgrade: v1->v2 negotiation support, this is the default)",
+        help=(
+            "prefer QUIC v2 (for upgrade: v1->v2"
+            " negotiation support, this is the default)"
+        ),
     )
     parser.add_argument(
         "--only-v1",
@@ -707,7 +726,11 @@ if __name__ == "__main__":
     if args.only_v2:
         version_flags.append("--only-v2")
     if len(version_flags) > 1:
-        parser.error("the following arguments are mutually exclusive: " + ", ".join(version_flags))
+        parser.error(
+            "the following arguments are mutually"
+            " exclusive: "
+            + ", ".join(version_flags)
+        )
 
     # Set environment variables based on command-line arguments
     if args.upload_dir is not None:
@@ -751,7 +774,10 @@ if __name__ == "__main__":
             QuicProtocolVersion.VERSION_1,
             QuicProtocolVersion.VERSION_2,
         ]
-        print("[server] Preferring QUIC v1 (supports both v1 and v2, compatible downgrade mode)")
+        print(
+            "[server] Preferring QUIC v1 (supports"
+            " both v1 and v2, compatible downgrade mode)"
+        )
     elif args.only_v1:
         supported_versions = [QuicProtocolVersion.VERSION_1]
         print("[server] Only supporting QUIC v1 (will send VN packet to v2 clients)")
@@ -778,7 +804,14 @@ if __name__ == "__main__":
         supported_versions=supported_versions,
     )
 
-    print("[server] Supported QUIC versions: %s" % ", ".join(pretty_protocol_version(v) for v in supported_versions))
+    ver_str = ", ".join(
+        pretty_protocol_version(v)
+        for v in supported_versions
+    )
+    print(
+        "[server] Supported QUIC versions: %s"
+        % ver_str
+    )
     logging.getLogger("server").info(
         "Server supported QUIC versions: %s",
         ", ".join(pretty_protocol_version(v) for v in supported_versions),
