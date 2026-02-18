@@ -25,7 +25,7 @@ from aioquic.h3.exceptions import NoAvailablePushIDError
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import DatagramFrameReceived, ProtocolNegotiated, QuicEvent
 from aioquic.quic.logger import QuicFileLogger
-from aioquic.quic.packet import QuicProtocolVersion
+from aioquic.quic.packet import QuicProtocolVersion, pretty_protocol_version
 from aioquic.tls import SessionTicket
 
 try:
@@ -551,7 +551,20 @@ async def main(
     configuration: QuicConfiguration,
     session_ticket_store: SessionTicketStore,
     retry: bool,
+    send_hrr: bool = False,
 ) -> None:
+    # --send-hrr uses the same QUIC retry mechanism for address validation
+    # (HelloRetryRequest-like behavior). Enable retry if HRR is requested.
+    use_retry = retry or send_hrr
+    if send_hrr:
+        print("[server] HRR (HelloRetryRequest) enabled: server will send retry packets for client address validation")
+        logging.getLogger("server").info(
+            "HRR enabled: sending retry packets for address validation (QUIC %s)",
+            ", ".join(pretty_protocol_version(v) for v in configuration.supported_versions),
+        )
+    elif retry:
+        print("[server] Retry enabled: server will send retry packets for new connections")
+        logging.getLogger("server").info("Retry enabled for new connections")
     await serve(
         host,
         port,
@@ -559,7 +572,7 @@ async def main(
         create_protocol=HttpServerProtocol,
         session_ticket_fetcher=session_ticket_store.pop,
         session_ticket_handler=session_ticket_store.add,
-        retry=retry,
+        retry=use_retry,
     )
     await asyncio.Future()
 
@@ -630,6 +643,31 @@ if __name__ == "__main__":
         help="send a retry for new connections",
     )
     parser.add_argument(
+        "--send-hrr",
+        action="store_true",
+        help="enable HelloRetryRequest (HRR): send retry packets for client address validation (works with both QUIC v1 and v2)",
+    )
+    parser.add_argument(
+        "--prefer-v1",
+        action="store_true",
+        help="prefer QUIC v1 (for downgrade: v2->v1 negotiation support)",
+    )
+    parser.add_argument(
+        "--prefer-v2",
+        action="store_true",
+        help="prefer QUIC v2 (for upgrade: v1->v2 negotiation support, this is the default)",
+    )
+    parser.add_argument(
+        "--only-v1",
+        action="store_true",
+        help="only support QUIC v1",
+    )
+    parser.add_argument(
+        "--only-v2",
+        action="store_true",
+        help="only support QUIC v2",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="increase logging verbosity"
     )
     parser.add_argument(
@@ -657,6 +695,19 @@ if __name__ == "__main__":
         help="QUIC idle timeout in seconds (default: 300 for long-running streams)",
     )
     args = parser.parse_args()
+
+    # Mutual exclusivity check for version flags
+    version_flags = []
+    if args.prefer_v1:
+        version_flags.append("--prefer-v1")
+    if args.prefer_v2:
+        version_flags.append("--prefer-v2")
+    if args.only_v1:
+        version_flags.append("--only-v1")
+    if args.only_v2:
+        version_flags.append("--only-v2")
+    if len(version_flags) > 1:
+        parser.error("the following arguments are mutually exclusive: " + ", ".join(version_flags))
 
     # Set environment variables based on command-line arguments
     if args.upload_dir is not None:
@@ -694,6 +745,27 @@ if __name__ == "__main__":
     else:
         secrets_log_file = None
 
+    # Determine supported versions based on version flags
+    if args.prefer_v1:
+        supported_versions = [
+            QuicProtocolVersion.VERSION_1,
+            QuicProtocolVersion.VERSION_2,
+        ]
+        print("[server] Preferring QUIC v1 (supports both v1 and v2, compatible downgrade mode)")
+    elif args.only_v1:
+        supported_versions = [QuicProtocolVersion.VERSION_1]
+        print("[server] Only supporting QUIC v1 (will send VN packet to v2 clients)")
+    elif args.only_v2:
+        supported_versions = [QuicProtocolVersion.VERSION_2]
+        print("[server] Only supporting QUIC v2 (will send VN packet to v1 clients)")
+    else:
+        # Default (and --prefer-v2): prefer v2, also support v1
+        supported_versions = [
+            QuicProtocolVersion.VERSION_2,
+            QuicProtocolVersion.VERSION_1,
+        ]
+        print("[server] Preferring QUIC v2 (supports both v1 and v2, default)")
+
     configuration = QuicConfiguration(
         alpn_protocols=H3_ALPN + H0_ALPN + ["siduck"],
         congestion_control_algorithm=args.congestion_control_algorithm,
@@ -703,10 +775,13 @@ if __name__ == "__main__":
         idle_timeout=args.idle_timeout,
         quic_logger=quic_logger,
         secrets_log_file=secrets_log_file,
-        supported_versions=[
-            QuicProtocolVersion.VERSION_2,
-            QuicProtocolVersion.VERSION_1,
-        ],
+        supported_versions=supported_versions,
+    )
+
+    print("[server] Supported QUIC versions: %s" % ", ".join(pretty_protocol_version(v) for v in supported_versions))
+    logging.getLogger("server").info(
+        "Server supported QUIC versions: %s",
+        ", ".join(pretty_protocol_version(v) for v in supported_versions),
     )
 
     # load SSL certificate and key
@@ -723,6 +798,7 @@ if __name__ == "__main__":
                 configuration=configuration,
                 session_ticket_store=SessionTicketStore(),
                 retry=args.retry,
+                send_hrr=args.send_hrr,
             )
         )
     except KeyboardInterrupt:
