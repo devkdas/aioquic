@@ -94,7 +94,8 @@ async def stream_random_data(request):
     """
     Long-lived streaming endpoint that sends random data periodically.
     Query params:
-      - duration: total duration in seconds (default: 0 = infinite, until client disconnects)
+      - duration: total duration in seconds
+        (default: 0 = infinite, until client disconnects)
       - interval: interval between chunks in seconds (default: 1.0)
       - chunk_size: size of each random data chunk in bytes (default: 1024, max: 65536)
       - chunk_min: minimum chunk size for variable mode (default: 0 = disabled)
@@ -108,7 +109,8 @@ async def stream_random_data(request):
     chunk_min = int(request.query_params.get("chunk_min", 0))
     chunk_max = int(request.query_params.get("chunk_max", 0))
     binary_mode = request.query_params.get("binary", "0") == "1"
-    max_rate = int(request.query_params.get("max_rate", 0))  # bytes per second, 0 = unlimited
+    # bytes per second, 0 = unlimited
+    max_rate = int(request.query_params.get("max_rate", 0))
 
     # Validate variable chunk size params
     variable_chunks = chunk_min > 0 and chunk_max > chunk_min
@@ -122,19 +124,30 @@ async def stream_random_data(request):
         total_bytes = 0
         rate_window_start = start_time
         rate_window_bytes = 0
-        
+
         try:
             while True:
                 elapsed = asyncio.get_event_loop().time() - start_time
                 # Only check duration if it's set (> 0)
                 if duration > 0 and elapsed >= duration:
                     if not binary_mode:
-                        yield f"\n[STREAM COMPLETE] Sent {chunk_count} chunks, {total_bytes} bytes over {elapsed:.1f}s\n".encode()
+                        msg = (
+                            f"\n[STREAM COMPLETE] Sent "
+                            f"{chunk_count} chunks, "
+                            f"{total_bytes} bytes over "
+                            f"{elapsed:.1f}s\n"
+                        )
+                        yield msg.encode()
                     break
-                
+
                 # Determine chunk size (variable or fixed)
-                current_chunk_size = random.randint(chunk_min, chunk_max) if variable_chunks else chunk_size
-                
+                if variable_chunks:
+                    current_chunk_size = random.randint(
+                        chunk_min, chunk_max
+                    )
+                else:
+                    current_chunk_size = chunk_size
+
                 # Generate data (binary or hex)
                 if binary_mode:
                     data = secrets.token_bytes(current_chunk_size)
@@ -142,16 +155,27 @@ async def stream_random_data(request):
                     random_data = secrets.token_hex(current_chunk_size // 2)
                     chunk_count += 1
                     timestamp = datetime.datetime.now().isoformat()
-                    preview = random_data[:64] + "..." if len(random_data) > 64 else random_data
-                    size_info = f" ({current_chunk_size}B)" if variable_chunks else ""
-                    data = f"[{timestamp}] Chunk {chunk_count}{size_info}: {preview}\n".encode()
-                
-                chunk_count += 1 if binary_mode else 0  # Already incremented for text mode
+                    if len(random_data) > 64:
+                        preview = random_data[:64] + "..."
+                    else:
+                        preview = random_data
+                    if variable_chunks:
+                        size_info = f" ({current_chunk_size}B)"
+                    else:
+                        size_info = ""
+                    data = (
+                        f"[{timestamp}] Chunk "
+                        f"{chunk_count}{size_info}: "
+                        f"{preview}\n"
+                    ).encode()
+
+                # Already incremented for text mode
+                chunk_count += 1 if binary_mode else 0
                 total_bytes += len(data)
                 rate_window_bytes += len(data)
-                
+
                 yield data
-                
+
                 # Bandwidth throttling
                 if max_rate > 0:
                     now = asyncio.get_event_loop().time()
@@ -168,7 +192,7 @@ async def stream_random_data(request):
                     if window_elapsed > 1.0:
                         rate_window_start = asyncio.get_event_loop().time()
                         rate_window_bytes = 0
-                
+
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             # Client disconnected
@@ -196,30 +220,36 @@ async def stream_bidirectional(request):
       - delay: delay before echoing each chunk in seconds (default: 0)
     """
     delay = float(request.query_params.get("delay", 0))
-    
+
     async def generate():
         chunk_count = 0
         total_bytes = 0
         start_time = asyncio.get_event_loop().time()
-        
+
         try:
             async for chunk in request.stream():
                 chunk_count += 1
                 total_bytes += len(chunk)
-                
+
                 if delay > 0:
                     await asyncio.sleep(delay)
-                
+
                 # Echo back with metadata prefix
                 timestamp = datetime.datetime.now().isoformat()
                 header = f"[{timestamp}] Echo {chunk_count} ({len(chunk)}B): ".encode()
                 yield header + chunk + b"\n"
-            
+
             elapsed = asyncio.get_event_loop().time() - start_time
-            yield f"\n[ECHO COMPLETE] Echoed {chunk_count} chunks, {total_bytes} bytes in {elapsed:.1f}s\n".encode()
+            msg = (
+                f"\n[ECHO COMPLETE] Echoed "
+                f"{chunk_count} chunks, "
+                f"{total_bytes} bytes in "
+                f"{elapsed:.1f}s\n"
+            )
+            yield msg.encode()
         except asyncio.CancelledError:
             pass
-    
+
     from starlette.responses import StreamingResponse
     return StreamingResponse(
         generate(),
@@ -335,7 +365,8 @@ starlette = Starlette(
         Route("/echo", echo, methods=["POST"]),  # Specific POST
         Route("/logs", logs),
         Route("/stream", stream_random_data),  # Long-lived streaming endpoint
-        Route("/stream-echo", stream_bidirectional, methods=["POST"]),  # Bidirectional streaming
+        # Bidirectional streaming
+        Route("/stream-echo", stream_bidirectional, methods=["POST"]),
         WebSocketRoute("/ws", ws),
         # Add the new root-level POST handler here
         Route("/{filepath:path}", handle_root_post_upload, methods=["POST", "PUT"]),
