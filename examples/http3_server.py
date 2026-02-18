@@ -650,6 +650,12 @@ if __name__ == "__main__":
             "in demo.py)"
         ),
     )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=300.0,
+        help="QUIC idle timeout in seconds (default: 300 for long-running streams)",
+    )
     args = parser.parse_args()
 
     # Set environment variables based on command-line arguments
@@ -694,6 +700,7 @@ if __name__ == "__main__":
         is_client=False,
         max_datagram_frame_size=65536,
         max_datagram_size=args.max_datagram_size,
+        idle_timeout=args.idle_timeout,
         quic_logger=quic_logger,
         secrets_log_file=secrets_log_file,
         supported_versions=[
