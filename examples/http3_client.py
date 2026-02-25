@@ -40,7 +40,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection, QuicTokenHandler
 from aioquic.quic.events import QuicEvent
 from aioquic.quic.logger import QuicFileLogger
-from aioquic.quic.packet import QuicProtocolVersion
+from aioquic.quic.packet import QuicProtocolVersion, pretty_protocol_version
 from aioquic.tls import CipherSuite, SessionTicket, SessionTicketHandler
 
 try:
@@ -145,6 +145,7 @@ class HttpClient(QuicConnectionProtocol):
         self._request_events: Dict[int, Deque[H3Event]] = {}
         self._request_waiter: Dict[int, asyncio.Future[Deque[H3Event]]] = {}
         self._websockets: Dict[int, WebSocket] = {}
+        self._stream_handlers: Dict[int, Callable[[bytes], None]] = {}
 
         if self._quic.configuration.alpn_protocols[0].startswith("hq-"):
             self._http = H0Connection(self._quic)
@@ -228,7 +229,17 @@ class HttpClient(QuicConnectionProtocol):
     def http_event_received(self, event: H3Event) -> None:
         if isinstance(event, (HeadersReceived, DataReceived)):
             stream_id = event.stream_id
-            if stream_id in self._request_events:
+            if stream_id in self._stream_handlers:
+                # streaming mode - call handler for each data chunk
+                if isinstance(event, DataReceived):
+                    self._stream_handlers[stream_id](event.data)
+                if event.stream_ended:
+                    # Clean up and signal completion
+                    del self._stream_handlers[stream_id]
+                    if stream_id in self._request_waiter:
+                        request_waiter = self._request_waiter.pop(stream_id)
+                        request_waiter.set_result(deque())  # Empty result for streaming
+            elif stream_id in self._request_events:
                 # http
                 self._request_events[event.stream_id].append(event)
                 if event.stream_ended:
@@ -327,6 +338,324 @@ class HttpClient(QuicConnectionProtocol):
         self.transmit()
 
         return await asyncio.shield(waiter)
+
+    async def stream_get(
+        self,
+        url: str,
+        data_handler: Callable[[bytes], None],
+        headers: Optional[Dict] = None,
+    ) -> None:
+        """
+        Perform a streaming GET request. Data is passed to data_handler as it arrives.
+        """
+        request = HttpRequest(method="GET", url=URL(url), headers=headers or {})
+        stream_id = self._quic.get_next_available_stream_id()
+
+        self._http.send_headers(
+            stream_id=stream_id,
+            headers=[
+                (b":method", request.method.encode()),
+                (b":scheme", request.url.scheme.encode()),
+                (b":authority", request.url.authority.encode()),
+                (b":path", request.url.full_path.encode()),
+                (b"user-agent", USER_AGENT.encode()),
+            ]
+            + [(k.encode(), v.encode()) for (k, v) in request.headers.items()],
+            end_stream=True,
+        )
+
+        waiter = self._loop.create_future()
+        self._stream_handlers[stream_id] = data_handler
+        self._request_waiter[stream_id] = waiter
+        self.transmit()
+
+        try:
+            await asyncio.shield(waiter)
+        finally:
+            # Clean up to prevent memory leaks in long-running sessions
+            self._stream_handlers.pop(stream_id, None)
+            self._request_waiter.pop(stream_id, None)
+
+
+async def perform_stream_request(
+    client: HttpClient,
+    url: str,
+    print_data: bool = True,
+    stream_id_label: Optional[int] = None,
+    binary_mode: bool = False,
+) -> None:
+    """
+    Perform a streaming request - receives data without saving.
+    stream_id_label: Optional label to identify this stream (for parallel streams)
+    binary_mode: If True, data is raw binary (don't try to decode as text)
+    """
+    total_bytes = 0
+    chunk_count = 0
+    start = time.time()
+    label = f"[Stream {stream_id_label}] " if stream_id_label else ""
+    short_label = f"[S{stream_id_label}]" if stream_id_label else ""
+
+    def data_handler(data: bytes) -> None:
+        nonlocal total_bytes, chunk_count
+        total_bytes += len(data)
+        chunk_count += 1
+        if print_data:
+            if binary_mode:
+                # Binary mode: just show stats
+                print(
+                    f"{short_label} [chunk {chunk_count}:"
+                    f" {len(data)} bytes]",
+                    flush=True,
+                )
+            else:
+                # Text mode: try to decode and print
+                try:
+                    text = data.decode()
+                    if stream_id_label:
+                        lines = text.split('\n')
+                        text = '\n'.join(
+                            f"[S{stream_id_label}] {line}"
+                            if line else ""
+                            for line in lines
+                        )
+                    print(text, end="", flush=True)
+                except UnicodeDecodeError:
+                    print(f"{short_label} [binary: {len(data)} bytes]", flush=True)
+
+    logger.info("%sStarting streaming request to %s", label, url)
+    await client.stream_get(url, data_handler)
+
+    elapsed = time.time() - start
+    logger.info(
+        "%sStream completed: %d bytes in %.1f s (%.3f Mbps)",
+        label,
+        total_bytes,
+        elapsed,
+        total_bytes * 8 / elapsed / 1000000 if elapsed > 0 else 0,
+    )
+
+
+async def keepalive_task(client: HttpClient, interval: float) -> None:
+    """
+    Send periodic PING frames to keep NAT mappings alive.
+    """
+    ping_uid = 0
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            client._quic.send_ping(ping_uid)
+            client.transmit()
+            ping_uid += 1
+            logger.debug(f"Keepalive PING sent (uid={ping_uid})")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Keepalive error: {e}")
+            break
+
+
+def generate_fuzz_data(size: int, fuzz_type: str = "random") -> bytes:
+    """
+    Generate malicious/fuzz test data for testing server robustness.
+    """
+    import random
+
+    if fuzz_type == "invalid_utf8":
+        # Invalid UTF-8 sequences
+        invalid_sequences = [
+            b'\x80\x81\x82',  # Continuation bytes without start
+            b'\xc0\xc1',      # Overlong encoding
+            b'\xf5\xf6\xf7',  # Invalid start bytes
+            b'\xfe\xff',      # Invalid bytes
+            b'\xed\xa0\x80',  # Surrogate halves
+            b'\xc0\xaf',      # Overlong slash
+        ]
+        data = b''
+        while len(data) < size:
+            data += random.choice(invalid_sequences)
+            data += bytes([
+                random.randint(0, 255)
+                for _ in range(random.randint(1, 10))
+            ])
+        return data[:size]
+
+    elif fuzz_type == "control_chars":
+        # Control characters and special bytes
+        control = bytes([0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 27, 127])
+        data = b''
+        while len(data) < size:
+            data += bytes([random.choice(control)])
+            data += bytes([
+                random.randint(32, 126)
+                for _ in range(random.randint(0, 5))
+            ])
+        return data[:size]
+
+    elif fuzz_type == "edge_cases":
+        # Edge case patterns
+        patterns = [
+            b'\x00' * 100,           # NULL bytes
+            b'\xff' * 100,           # All 1s
+            b'\x00\xff' * 50,        # Alternating
+            b'A' * 1000,             # Repeated char
+            b'\r\n' * 50,            # CRLF spam
+            b'../../etc/passwd',     # Path traversal
+            b'<script>alert(1)</script>',  # XSS
+            b"'; DROP TABLE--",      # SQL injection pattern
+            b'\x00\x00\x00\x00',     # Null padding
+        ]
+        data = b''
+        while len(data) < size:
+            data += random.choice(patterns)
+        return data[:size]
+
+    else:  # mixed fuzz
+        # Combine all patterns randomly
+        types = ["invalid_utf8", "control_chars", "edge_cases"]
+        data = b''
+        chunk = size // 4
+        for t in types:
+            data += generate_fuzz_data(chunk, t)
+        # Fill remainder with random bytes
+        data += bytes([random.randint(0, 255) for _ in range(size - len(data))])
+        return data[:size]
+
+
+async def perform_bidi_stream(
+    client: HttpClient,
+    url: str,
+    chunk_size: int = 1024,
+    chunk_min: int = 0,
+    chunk_max: int = 0,
+    interval: float = 1.0,
+    duration: int = 0,
+    print_data: bool = True,
+    stream_id_label: Optional[int] = None,
+    fuzz_mode: bool = False,
+) -> None:
+    """
+    Perform bidirectional streaming - client sends data, server echoes back.
+    chunk_min/chunk_max: If both > 0 and max > min, use variable chunk sizes.
+    fuzz_mode: If True, send malicious/fuzz test data instead of random bytes.
+    """
+    import random
+    import secrets
+
+    variable_chunks = chunk_min > 0 and chunk_max > chunk_min
+    fuzz_types = ["invalid_utf8", "control_chars", "edge_cases", "mixed"]
+    total_sent = 0
+    total_received = 0
+    chunks_sent = 0
+    start = time.time()
+    label = f"[Stream {stream_id_label}] " if stream_id_label else ""
+    short_label = f"[S{stream_id_label}]" if stream_id_label else ""
+
+    def response_handler(data: bytes) -> None:
+        nonlocal total_received
+        total_received += len(data)
+        if print_data:
+            try:
+                text = data.decode()
+                if stream_id_label:
+                    lines = text.split('\n')
+                    text = '\n'.join(
+                        f"{short_label} {line}"
+                        if line else ""
+                        for line in lines
+                    )
+                print(text, end="", flush=True)
+            except UnicodeDecodeError:
+                print(f"{short_label} [received: {len(data)} bytes]", flush=True)
+
+    logger.info("%sBidirectional streaming to %s", label, url)
+
+    # For bidirectional, we need to use POST with streaming body
+    # This is a simplified implementation - send chunks and receive echoes
+    stream_id = client._quic.get_next_available_stream_id()
+
+    # Send headers
+    client._http.send_headers(
+        stream_id=stream_id,
+        headers=[
+            (b":method", b"POST"),
+            (b":scheme", URL(url).scheme.encode()),
+            (b":authority", URL(url).authority.encode()),
+            (b":path", URL(url).full_path.encode()),
+            (b"content-type", b"application/octet-stream"),
+            (b"user-agent", USER_AGENT.encode()),
+        ],
+        end_stream=False,
+    )
+
+    # Register handler for responses
+    client._stream_handlers[stream_id] = response_handler
+    waiter = client._loop.create_future()
+    client._request_waiter[stream_id] = waiter
+    client.transmit()
+
+    # Send data chunks
+    try:
+        while True:
+            elapsed = time.time() - start
+            if duration > 0 and elapsed >= duration:
+                break
+
+            # Generate and send chunk (variable or fixed size)
+            if variable_chunks:
+                current_size = random.randint(
+                    chunk_min, chunk_max
+                )
+            else:
+                current_size = chunk_size
+
+            if fuzz_mode:
+                # Rotate through different fuzz types
+                fuzz_type = fuzz_types[chunks_sent % len(fuzz_types)]
+                chunk = generate_fuzz_data(current_size, fuzz_type)
+                fuzz_label = f" ({fuzz_type})"
+            else:
+                chunk = secrets.token_bytes(current_size)
+                fuzz_label = ""
+
+            client._http.send_data(stream_id=stream_id, data=chunk, end_stream=False)
+            client.transmit()
+            total_sent += len(chunk)
+            chunks_sent += 1
+
+            if print_data:
+                print(
+                    f"{short_label} [sent chunk"
+                    f" {chunks_sent}: {len(chunk)}"
+                    f" bytes{fuzz_label}]",
+                    flush=True,
+                )
+
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        # End the stream
+        client._http.send_data(stream_id=stream_id, data=b"", end_stream=True)
+        client.transmit()
+
+    # Wait for final response
+    try:
+        await asyncio.wait_for(waiter, timeout=5.0)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        # Clean up stream handlers to prevent memory leaks
+        client._stream_handlers.pop(stream_id, None)
+        client._request_waiter.pop(stream_id, None)
+
+    elapsed = time.time() - start
+    logger.info(
+        "%sBidi completed: sent %d bytes, received %d bytes in %.1f s",
+        label,
+        total_sent,
+        total_received,
+        elapsed,
+    )
 
 
 async def perform_http_request(
@@ -458,6 +787,19 @@ async def main(
     zero_rtt: bool,
     upload_file: Optional[str] = None,
     num_streams: int = 1,
+    stream_mode: bool = False,
+    stream_quiet: bool = False,
+    stream_interval: float = 1.0,
+    stream_chunk_size: int = 1024,
+    stream_duration: int = 0,
+    stream_chunk_vary: str = "",
+    stream_binary: bool = False,
+    stream_max_rate: int = 0,
+    stream_reconnect: int = 0,
+    stream_bidi: bool = False,
+    stream_fuzz: bool = False,
+    keepalive: float = 0,
+    expect_hrr: bool = False,
 ) -> None:
     # parse URL
     parsed = urlparse(urls[0])
@@ -503,6 +845,80 @@ async def main(
     ) as client:
         client = cast(HttpClient, client)
 
+        # Log HRR result after handshake
+        if expect_hrr:
+            has_retry = (
+                hasattr(client._quic, '_retry_source_connection_id')
+                and client._quic._retry_source_connection_id
+                is not None
+            )
+            if has_retry:
+                print(
+                    "[client] HRR (HelloRetryRequest) "
+                    "completed: server sent retry packet"
+                    " for address validation"
+                )
+                logger.info(
+                    "HRR completed: server sent retry"
+                    " packet for address validation"
+                )
+            else:
+                print(
+                    "[client] HRR expected but no"
+                    " retry packet was received"
+                    " from server"
+                )
+                logger.info(
+                    "HRR expected but no retry packet"
+                    " was received from server"
+                )
+
+        # Log version negotiation result after handshake
+        negotiated_version = client._quic._version
+        if negotiated_version is not None:
+            print(
+                "[client] Handshake complete."
+                " Negotiated QUIC version: %s"
+                % pretty_protocol_version(negotiated_version)
+            )
+            logger.info(
+                "Handshake complete. Negotiated QUIC version: %s",
+                pretty_protocol_version(negotiated_version),
+            )
+            orig = configuration.original_version
+            if orig is not None and negotiated_version != orig:
+                orig_str = pretty_protocol_version(orig)
+                neg_str = pretty_protocol_version(
+                    negotiated_version
+                )
+                if client._quic._version_negotiated_incompatible:
+                    print(
+                        "[client] Version changed"
+                        " from %s -> %s (via VN packet,"
+                        " incompatible negotiation)"
+                        % (orig_str, neg_str)
+                    )
+                    logger.info(
+                        "Version changed from %s -> %s"
+                        " (via VN packet, incompatible"
+                        " negotiation)",
+                        orig_str,
+                        neg_str,
+                    )
+                else:
+                    print(
+                        "[client] Version changed"
+                        " from %s -> %s (compatible"
+                        " negotiation, no VN packet)"
+                        % (orig_str, neg_str)
+                    )
+                    logger.info(
+                        "Version changed from %s -> %s"
+                        " (compatible negotiation)",
+                        orig_str,
+                        neg_str,
+                    )
+
         if parsed.scheme == "wss":
             ws = await client.websocket(urls[0], subprotocols=["chat", "superchat"])
 
@@ -516,6 +932,233 @@ async def main(
                 print("< " + message)
 
             await ws.close()
+        elif stream_bidi:
+            # Bidirectional streaming mode - client sends data, server echoes back
+            logger.info("Bidirectional streaming mode enabled")
+            duration_str = "infinite" if stream_duration == 0 else f"{stream_duration}s"
+
+            # Parse variable chunk sizes for bidi mode
+            chunk_min, chunk_max = 0, 0
+            if stream_chunk_vary:
+                try:
+                    parts = stream_chunk_vary.split(",")
+                    chunk_min, chunk_max = int(parts[0]), int(parts[1])
+                except (ValueError, IndexError):
+                    pass
+
+            # Build settings log
+            if chunk_min > 0 and chunk_max > chunk_min:
+                chunk_info = f"chunk_vary={chunk_min}-{chunk_max}"
+            else:
+                chunk_info = f"chunk_size={stream_chunk_size}"
+            fuzz_info = ", fuzz=ON" if stream_fuzz else ""
+            logger.info(
+                "Bidi settings: duration=%s,"
+                " interval=%ss, %s,"
+                " num_streams=%d%s",
+                duration_str,
+                stream_interval,
+                chunk_info,
+                num_streams,
+                fuzz_info,
+            )
+
+            all_coros = []
+            for url_str in urls:
+                # Use /stream-echo endpoint for bidi
+                if "/stream-echo" in url_str:
+                    bidi_url = url_str
+                elif "/stream" in url_str:
+                    bidi_url = url_str.replace("/stream", "/stream-echo")
+                else:
+                    bidi_url = url_str
+                for stream_idx in range(num_streams):
+                    all_coros.append(
+                        perform_bidi_stream(
+                            client=client,
+                            url=bidi_url,
+                            chunk_size=stream_chunk_size,
+                            chunk_min=chunk_min,
+                            chunk_max=chunk_max,
+                            interval=stream_interval,
+                            duration=stream_duration,
+                            print_data=not stream_quiet,
+                            stream_id_label=(
+                                stream_idx + 1
+                                if num_streams > 1
+                                else None
+                            ),
+                            fuzz_mode=stream_fuzz,
+                        )
+                    )
+
+            if all_coros:
+                logger.info(f"Starting {len(all_coros)} bidirectional stream(s)")
+                # Start keepalive task if enabled
+                keepalive_handle = None
+                if keepalive > 0:
+                    logger.info(f"Keepalive enabled: PING every {keepalive}s")
+                    keepalive_handle = asyncio.create_task(
+                        keepalive_task(client, keepalive)
+                    )
+                try:
+                    results = await asyncio.gather(
+                        *all_coros, return_exceptions=True
+                    )
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            logger.error(f"Bidi stream {i+1} error: {result}")
+                finally:
+                    if keepalive_handle:
+                        keepalive_handle.cancel()
+                        try:
+                            await keepalive_handle
+                        except asyncio.CancelledError:
+                            pass
+        elif stream_mode:
+            # Streaming mode: long-lived connection, server pushes data
+            logger.info("Streaming mode enabled - receiving data without saving")
+            duration_str = "infinite" if stream_duration == 0 else f"{stream_duration}s"
+
+            # Parse variable chunk sizes
+            chunk_min, chunk_max = 0, 0
+            if stream_chunk_vary:
+                try:
+                    parts = stream_chunk_vary.split(",")
+                    chunk_min, chunk_max = int(parts[0]), int(parts[1])
+                    logger.info(f"Variable chunk sizes: {chunk_min}-{chunk_max} bytes")
+                except (ValueError, IndexError):
+                    logger.warning(
+                        "Invalid --stream-chunk-vary"
+                        " format '%s', using fixed size",
+                        stream_chunk_vary,
+                    )
+
+            # Build settings log
+            settings = [f"duration={duration_str}", f"interval={stream_interval}s"]
+            if chunk_min > 0 and chunk_max > chunk_min:
+                settings.append(f"chunk_vary={chunk_min}-{chunk_max}")
+            else:
+                settings.append(f"chunk_size={stream_chunk_size}")
+            if stream_binary:
+                settings.append("binary=true")
+            if stream_max_rate > 0:
+                settings.append(f"max_rate={stream_max_rate}B/s")
+            settings.append(f"num_streams={num_streams}")
+            logger.info("Stream settings: %s", ', '.join(settings))
+
+            retry_count = 0
+            while True:
+                all_coros = []
+                for url_str in urls:
+                    # Build query params
+                    separator = "&" if "?" in url_str else "?"
+                    params = [
+                        f"duration={stream_duration}",
+                        f"interval={stream_interval}",
+                    ]
+                    if chunk_min > 0 and chunk_max > chunk_min:
+                        params.extend([
+                            f"chunk_min={chunk_min}",
+                            f"chunk_max={chunk_max}",
+                        ])
+                    else:
+                        params.append(f"chunk_size={stream_chunk_size}")
+                    if stream_binary:
+                        params.append("binary=1")
+                    if stream_max_rate > 0:
+                        params.append(f"max_rate={stream_max_rate}")
+
+                    stream_url = (
+                        f"{url_str}{separator}"
+                        f"{'&'.join(params)}"
+                    )
+
+                    # Create num_streams parallel streams for each URL
+                    for stream_idx in range(num_streams):
+                        all_coros.append(
+                            perform_stream_request(
+                                client=client,
+                                url=stream_url,
+                                print_data=not stream_quiet,
+                                stream_id_label=(
+                                    stream_idx + 1
+                                    if num_streams > 1
+                                    else None
+                                ),
+                                binary_mode=stream_binary,
+                            )
+                        )
+
+                if all_coros:
+                    logger.info(f"Starting {len(all_coros)} parallel stream(s)")
+                    # Start keepalive task if enabled
+                    keepalive_handle = None
+                    if keepalive > 0:
+                        logger.info(f"Keepalive enabled: PING every {keepalive}s")
+                        keepalive_handle = asyncio.create_task(
+                            keepalive_task(client, keepalive)
+                        )
+                    try:
+                        results = await asyncio.gather(
+                            *all_coros, return_exceptions=True
+                        )
+                        has_error = False
+                        for i, result in enumerate(results):
+                            if isinstance(result, Exception):
+                                has_error = True
+                                logger.error(
+                                    f"Stream {i+1} encountered an error: {result}",
+                                    exc_info=(
+                                        result
+                                        if isinstance(
+                                            result,
+                                            BaseException,
+                                        )
+                                        else None
+                                    ),
+                                )
+
+                        # Auto-reconnect logic
+                        if (
+                            has_error
+                            and stream_reconnect > 0
+                            and retry_count < stream_reconnect
+                        ):
+                            retry_count += 1
+                            logger.info(
+                                "Reconnecting... (attempt"
+                                " %d/%d)",
+                                retry_count,
+                                stream_reconnect,
+                            )
+                            await asyncio.sleep(1)  # Brief delay before reconnect
+                            continue
+                    except Exception as e:
+                        if (
+                            stream_reconnect > 0
+                            and retry_count < stream_reconnect
+                        ):
+                            retry_count += 1
+                            logger.info(
+                                "Connection error: %s."
+                                " Reconnecting..."
+                                " (attempt %d/%d)",
+                                e,
+                                retry_count,
+                                stream_reconnect,
+                            )
+                            await asyncio.sleep(1)
+                            continue
+                        raise
+                    finally:
+                        if keepalive_handle:
+                            keepalive_handle.cancel()
+                            try:
+                                await keepalive_handle
+                            except asyncio.CancelledError:
+                                pass
+                break  # Exit retry loop on success or no reconnect
         else:
             # When using --num-streams, the client will attempt to create
             # multiple streams for each specified URL.
@@ -832,11 +1475,55 @@ if __name__ == "__main__":
         action="store_true",
         help="start with QUIC v1 and try to negotiate QUIC v2",
     )
-
+    parser.add_argument(
+        "--upgrade-v2",
+        action="store_true",
+        help=(
+            "upgrade: start with QUIC v1, negotiate to"
+            " QUIC v2 (alias for --negotiate-v2)"
+        ),
+    )
+    parser.add_argument(
+        "--downgrade-v1",
+        action="store_true",
+        help=(
+            "downgrade: start with QUIC v2, negotiate"
+            " to QUIC v1 (compatible, no VN packet)"
+        ),
+    )
+    parser.add_argument(
+        "--vn-upgrade-v2",
+        action="store_true",
+        help=(
+            "upgrade via VN packet: start with QUIC v1"
+            " only, server rejects and sends VN,"
+            " client restarts with v2"
+            " (requires server --only-v2)"
+        ),
+    )
+    parser.add_argument(
+        "--vn-downgrade-v1",
+        action="store_true",
+        help=(
+            "downgrade via VN packet: start with QUIC"
+            " v2 only, server rejects and sends VN,"
+            " client restarts with v1"
+            " (requires server --only-v1)"
+        ),
+    )
     parser.add_argument(
         "--strictly-v2",
         action="store_true",
         help="connect using only QUIC v2, fail if not supported",
+    )
+    parser.add_argument(
+        "--expect-hrr",
+        action="store_true",
+        help=(
+            "expect HelloRetryRequest (HRR) from server:"
+            " log HRR-related events"
+            " (works with both QUIC v1 and v2)"
+        ),
     )
 
     parser.add_argument(
@@ -897,11 +1584,117 @@ if __name__ == "__main__":
         default=1,
         help="the number of streams to create (default: 1)",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "enable streaming mode for long-lived"
+            " connections (server pushes data,"
+            " client receives without saving)"
+        ),
+    )
+    parser.add_argument(
+        "--stream-quiet",
+        action="store_true",
+        help="in streaming mode, don't print received data (only log stats)",
+    )
+    parser.add_argument(
+        "--stream-interval",
+        type=float,
+        default=1.0,
+        help="interval between data chunks in seconds (default: 1.0)",
+    )
+    parser.add_argument(
+        "--stream-chunk-size",
+        type=int,
+        default=1024,
+        help="size of each random data chunk in bytes (default: 1024)",
+    )
+    parser.add_argument(
+        "--stream-duration",
+        type=int,
+        default=0,
+        help=(
+            "duration of streaming in seconds"
+            " (default: 0 = infinite, runs until Ctrl+C)"
+        ),
+    )
+    parser.add_argument(
+        "--stream-chunk-vary",
+        type=str,
+        default="",
+        help=(
+            "variable chunk sizes as 'min,max'"
+            " (e.g., '512,4096')."
+            " Overrides --stream-chunk-size"
+        ),
+    )
+    parser.add_argument(
+        "--stream-binary",
+        action="store_true",
+        help="use binary mode (raw bytes instead of hex text) for higher throughput",
+    )
+    parser.add_argument(
+        "--stream-max-rate",
+        type=int,
+        default=0,
+        help="maximum bandwidth in bytes/sec (default: 0 = unlimited)",
+    )
+    parser.add_argument(
+        "--stream-reconnect",
+        type=int,
+        default=0,
+        help="auto-reconnect on disconnect, max retries (default: 0 = disabled)",
+    )
+    parser.add_argument(
+        "--stream-bidi",
+        action="store_true",
+        help="bidirectional streaming mode - client sends data, server echoes back",
+    )
+    parser.add_argument(
+        "--stream-fuzz",
+        action="store_true",
+        help="send malicious/fuzz test data (invalid UTF-8, control chars, edge cases)",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=300.0,
+        help=(
+            "QUIC idle timeout in seconds (default: 300"
+            " for streaming, use higher for long sessions)"
+        ),
+    )
+    parser.add_argument(
+        "--keepalive",
+        type=float,
+        default=0,
+        help="send PING frames every N seconds to keep NAT mappings alive (0=disabled)",
+    )
 
     args = parser.parse_args()
 
-    if args.negotiate_v2 and args.strictly_v2:
-        parser.error("argument --strictly-v2: not allowed with argument --negotiate-v2")
+    # Merge --upgrade-v2 into --negotiate-v2 (they are aliases)
+    if args.upgrade_v2:
+        args.negotiate_v2 = True
+
+    # Mutual exclusivity check for version flags
+    version_flags = []
+    if args.negotiate_v2:
+        version_flags.append("--negotiate-v2/--upgrade-v2")
+    if args.downgrade_v1:
+        version_flags.append("--downgrade-v1")
+    if args.vn_upgrade_v2:
+        version_flags.append("--vn-upgrade-v2")
+    if args.vn_downgrade_v1:
+        version_flags.append("--vn-downgrade-v1")
+    if args.strictly_v2:
+        version_flags.append("--strictly-v2")
+    if len(version_flags) > 1:
+        parser.error(
+            "the following arguments are mutually"
+            " exclusive: " + ", ".join(version_flags)
+        )
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -917,6 +1710,7 @@ if __name__ == "__main__":
         alpn_protocols=H0_ALPN if args.legacy_http else H3_ALPN,
         congestion_control_algorithm=args.congestion_control_algorithm,
         max_datagram_size=args.max_datagram_size,
+        idle_timeout=args.idle_timeout,
     )
     if args.ca_certs:
         configuration.load_verify_locations(args.ca_certs)
@@ -936,9 +1730,110 @@ if __name__ == "__main__":
             QuicProtocolVersion.VERSION_2,
             QuicProtocolVersion.VERSION_1,
         ]
+        v1_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_1
+        )
+        v2_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_2
+        )
+        print(
+            "[client] Upgrading (compatible):"
+            " starting with %s, will negotiate"
+            " to %s (no VN packet)"
+            % (v1_str, v2_str)
+        )
+        logger.info(
+            "Upgrade mode: starting with %s, will negotiate to %s",
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+        )
+    elif args.downgrade_v1:
+        configuration.original_version = QuicProtocolVersion.VERSION_2
+        configuration.supported_versions = [
+            QuicProtocolVersion.VERSION_1,
+            QuicProtocolVersion.VERSION_2,
+        ]
+        v2_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_2
+        )
+        v1_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_1
+        )
+        print(
+            "[client] Downgrading (compatible):"
+            " starting with %s, will negotiate"
+            " to %s (no VN packet)"
+            % (v2_str, v1_str)
+        )
+        logger.info(
+            "Downgrade mode: starting with %s, will negotiate to %s",
+            pretty_protocol_version(QuicProtocolVersion.VERSION_2),
+            pretty_protocol_version(QuicProtocolVersion.VERSION_1),
+        )
+    elif args.vn_upgrade_v2:
+        configuration.original_version = QuicProtocolVersion.VERSION_1
+        configuration.supported_versions = [
+            QuicProtocolVersion.VERSION_2,
+            QuicProtocolVersion.VERSION_1,
+        ]
+        v1_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_1
+        )
+        v2_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_2
+        )
+        print(
+            "[client] Upgrading (with VN packet):"
+            " sending Initial with %s, expecting"
+            " VN packet from server,"
+            " will restart with %s"
+            % (v1_str, v2_str)
+        )
+        logger.info(
+            "VN upgrade mode: sending Initial"
+            " with %s, expecting VN packet,"
+            " will restart with %s"
+            " (server must use --only-v2)",
+            v1_str,
+            v2_str,
+        )
+    elif args.vn_downgrade_v1:
+        configuration.original_version = QuicProtocolVersion.VERSION_2
+        configuration.supported_versions = [
+            QuicProtocolVersion.VERSION_1,
+            QuicProtocolVersion.VERSION_2,
+        ]
+        v2_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_2
+        )
+        v1_str = pretty_protocol_version(
+            QuicProtocolVersion.VERSION_1
+        )
+        print(
+            "[client] Downgrading (with VN packet):"
+            " sending Initial with %s, expecting"
+            " VN packet from server,"
+            " will restart with %s"
+            % (v2_str, v1_str)
+        )
+        logger.info(
+            "VN downgrade mode: sending Initial"
+            " with %s, expecting VN packet,"
+            " will restart with %s"
+            " (server must use --only-v1)",
+            v2_str,
+            v1_str,
+        )
     elif args.strictly_v2:
         configuration.original_version = QuicProtocolVersion.VERSION_2
         configuration.supported_versions = [QuicProtocolVersion.VERSION_2]
+    if args.expect_hrr:
+        print(
+            "[client] Expecting HRR (HelloRetryRequest)"
+            " from server: server should send retry"
+            " packet for address validation"
+        )
+        logger.info("Expecting HRR from server (works with both QUIC v1 and v2)")
     if args.quic_log:
         configuration.quic_logger = QuicFileLogger(args.quic_log)
     if args.secrets_log:
@@ -975,5 +1870,18 @@ if __name__ == "__main__":
             zero_rtt=args.zero_rtt,
             upload_file=args.upload_file,
             num_streams=args.num_streams,
+            stream_mode=args.stream,
+            stream_quiet=args.stream_quiet,
+            stream_interval=args.stream_interval,
+            stream_chunk_size=args.stream_chunk_size,
+            stream_duration=args.stream_duration,
+            stream_chunk_vary=args.stream_chunk_vary,
+            stream_binary=args.stream_binary,
+            stream_max_rate=args.stream_max_rate,
+            stream_reconnect=args.stream_reconnect,
+            stream_bidi=args.stream_bidi,
+            stream_fuzz=args.stream_fuzz,
+            keepalive=args.keepalive,
+            expect_hrr=args.expect_hrr,
         )
     )

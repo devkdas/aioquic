@@ -2,8 +2,11 @@
 # demo application for http3_server.py
 #
 
+import asyncio
 import datetime
 import os
+import random
+import secrets
 from urllib.parse import urlencode
 
 import aiofiles  # type: ignore
@@ -85,6 +88,174 @@ async def padding(request):
     """
     size = min(50000000, request.path_params["size"])
     return PlainTextResponse("Z" * size)
+
+
+async def stream_random_data(request):
+    """
+    Long-lived streaming endpoint that sends random data periodically.
+    Query params:
+      - duration: total duration in seconds
+        (default: 0 = infinite, until client disconnects)
+      - interval: interval between chunks in seconds (default: 1.0)
+      - chunk_size: size of each random data chunk in bytes (default: 1024, max: 65536)
+      - chunk_min: minimum chunk size for variable mode (default: 0 = disabled)
+      - chunk_max: maximum chunk size for variable mode (default: 0 = disabled)
+      - binary: if "1", send raw binary data instead of hex text (default: 0)
+      - max_rate: maximum bytes per second (default: 0 = unlimited)
+    """
+    duration = int(request.query_params.get("duration", 0))  # 0 = infinite
+    interval = max(0.01, float(request.query_params.get("interval", 1.0)))
+    chunk_size = min(65536, int(request.query_params.get("chunk_size", 1024)))
+    chunk_min = int(request.query_params.get("chunk_min", 0))
+    chunk_max = int(request.query_params.get("chunk_max", 0))
+    binary_mode = request.query_params.get("binary", "0") == "1"
+    # bytes per second, 0 = unlimited
+    max_rate = int(request.query_params.get("max_rate", 0))
+
+    # Validate variable chunk size params
+    variable_chunks = chunk_min > 0 and chunk_max > chunk_min
+    if variable_chunks:
+        chunk_min = min(65536, chunk_min)
+        chunk_max = min(65536, chunk_max)
+
+    async def generate():
+        start_time = asyncio.get_event_loop().time()
+        chunk_count = 0
+        total_bytes = 0
+        rate_window_start = start_time
+        rate_window_bytes = 0
+
+        try:
+            while True:
+                elapsed = asyncio.get_event_loop().time() - start_time
+                # Only check duration if it's set (> 0)
+                if duration > 0 and elapsed >= duration:
+                    if not binary_mode:
+                        msg = (
+                            f"\n[STREAM COMPLETE] Sent "
+                            f"{chunk_count} chunks, "
+                            f"{total_bytes} bytes over "
+                            f"{elapsed:.1f}s\n"
+                        )
+                        yield msg.encode()
+                    break
+
+                # Determine chunk size (variable or fixed)
+                if variable_chunks:
+                    current_chunk_size = random.randint(
+                        chunk_min, chunk_max
+                    )
+                else:
+                    current_chunk_size = chunk_size
+
+                # Generate data (binary or hex)
+                if binary_mode:
+                    data = secrets.token_bytes(current_chunk_size)
+                else:
+                    random_data = secrets.token_hex(current_chunk_size // 2)
+                    chunk_count += 1
+                    timestamp = datetime.datetime.now().isoformat()
+                    if len(random_data) > 64:
+                        preview = random_data[:64] + "..."
+                    else:
+                        preview = random_data
+                    if variable_chunks:
+                        size_info = f" ({current_chunk_size}B)"
+                    else:
+                        size_info = ""
+                    data = (
+                        f"[{timestamp}] Chunk "
+                        f"{chunk_count}{size_info}: "
+                        f"{preview}\n"
+                    ).encode()
+
+                # Already incremented for text mode
+                chunk_count += 1 if binary_mode else 0
+                total_bytes += len(data)
+                rate_window_bytes += len(data)
+
+                yield data
+
+                # Bandwidth throttling
+                if max_rate > 0:
+                    now = asyncio.get_event_loop().time()
+                    window_elapsed = now - rate_window_start
+                    if window_elapsed > 0:
+                        current_rate = rate_window_bytes / window_elapsed
+                        if current_rate > max_rate:
+                            # Need to slow down - calculate required delay
+                            required_time = rate_window_bytes / max_rate
+                            delay = required_time - window_elapsed
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                    # Reset window periodically
+                    if window_elapsed > 1.0:
+                        rate_window_start = asyncio.get_event_loop().time()
+                        rate_window_bytes = 0
+
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            # Client disconnected
+            pass
+
+    from starlette.responses import StreamingResponse
+    media_type = "application/octet-stream" if binary_mode else "text/plain"
+    return StreamingResponse(
+        generate(),
+        media_type=media_type,
+        headers={
+            "X-Stream-Duration": "infinite" if duration == 0 else str(duration),
+            "X-Stream-Interval": str(interval),
+            "X-Stream-Binary": "1" if binary_mode else "0",
+            "X-Stream-Variable": "1" if variable_chunks else "0",
+        }
+    )
+
+
+async def stream_bidirectional(request):
+    """
+    Bidirectional streaming endpoint - echoes back data sent by client.
+    Client sends POST with streaming body, server echoes each chunk back.
+    Query params:
+      - delay: delay before echoing each chunk in seconds (default: 0)
+    """
+    delay = float(request.query_params.get("delay", 0))
+
+    async def generate():
+        chunk_count = 0
+        total_bytes = 0
+        start_time = asyncio.get_event_loop().time()
+
+        try:
+            async for chunk in request.stream():
+                chunk_count += 1
+                total_bytes += len(chunk)
+
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                # Echo back with metadata prefix
+                timestamp = datetime.datetime.now().isoformat()
+                header = f"[{timestamp}] Echo {chunk_count} ({len(chunk)}B): ".encode()
+                yield header + chunk + b"\n"
+
+            elapsed = asyncio.get_event_loop().time() - start_time
+            msg = (
+                f"\n[ECHO COMPLETE] Echoed "
+                f"{chunk_count} chunks, "
+                f"{total_bytes} bytes in "
+                f"{elapsed:.1f}s\n"
+            )
+            yield msg.encode()
+        except asyncio.CancelledError:
+            pass
+
+    from starlette.responses import StreamingResponse
+    return StreamingResponse(
+        generate(),
+        media_type="application/octet-stream",
+        headers={"X-Stream-Mode": "bidirectional"}
+    )
 
 
 async def ws(websocket):
@@ -193,6 +364,9 @@ starlette = Starlette(
         Route("/{size:int}", padding),
         Route("/echo", echo, methods=["POST"]),  # Specific POST
         Route("/logs", logs),
+        Route("/stream", stream_random_data),  # Long-lived streaming endpoint
+        # Bidirectional streaming
+        Route("/stream-echo", stream_bidirectional, methods=["POST"]),
         WebSocketRoute("/ws", ws),
         # Add the new root-level POST handler here
         Route("/{filepath:path}", handle_root_post_upload, methods=["POST", "PUT"]),
